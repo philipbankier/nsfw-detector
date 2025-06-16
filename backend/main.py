@@ -5,14 +5,14 @@ import subprocess
 import base64
 import json
 import asyncio
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Literal
 from datetime import datetime
 from pathlib import Path
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 import aiohttp
 import cv2
 import numpy as np
@@ -21,6 +21,7 @@ import io
 import replicate
 import google.generativeai as genai
 from dotenv import load_dotenv
+import whisper
 
 # Load environment variables
 load_dotenv()
@@ -77,17 +78,46 @@ if GEMINI_API_KEY:
 else:
     logger.warning("❌ Gemini API key not found")
 
+# Initialize Whisper model
+whisper_model = None
+
+def get_whisper_model():
+    """Get or initialize Whisper model"""
+    global whisper_model
+    if whisper_model is None:
+        logger.info("Loading Whisper base.en model...")
+        whisper_model = whisper.load_model("base.en")
+        logger.info("Whisper model loaded successfully")
+    return whisper_model
+
 # Response Models
 class AnalysisResult(BaseModel):
     method: str
-    is_nsfw: bool
-    category: str
-    explanation: str
-    confidence: Optional[float] = None
+    status: str  # "safe" or "nsfw"
+    categories: List[str]  # ["pornography", "violence", "self-harm", "weapons", "profanity", "other"]
+    severity: int  # 0-5
+    description: str  # Brief 1-2 sentence description
 
 class ErrorResponse(BaseModel):
     error: str
     details: Optional[str] = None
+
+class GeminiResponse(BaseModel):
+    status: Literal["safe", "nsfw"]
+    categories: List[str]
+    severity: int = Field(ge=0, le=5)
+    description: str
+    
+    @field_validator('categories')
+    @classmethod
+    def validate_categories(cls, v):
+        valid_categories = {'pornography', 'violence', 'self-harm', 'weapons', 'profanity', 'other'}
+        # Filter to only valid categories
+        filtered_categories = [cat for cat in v if cat in valid_categories]
+        # If no valid categories found, default to 'other'
+        if not filtered_categories:
+            return ['other']
+        return filtered_categories
 
 # Utility Functions
 async def get_video_duration(file_path: str) -> float:
@@ -180,6 +210,25 @@ async def extract_video_frames(file_path: str, num_frames: int = 5) -> List[str]
     
     return frames
 
+def extract_json_from_markdown(text: str) -> str:
+    """Extract JSON from markdown code blocks"""
+    # Remove markdown code blocks if present
+    if "```json" in text:
+        # Find the JSON content between ```json and ```
+        start = text.find("```json") + 7
+        end = text.find("```", start)
+        if end != -1:
+            return text[start:end].strip()
+    elif "```" in text:
+        # Handle generic code blocks
+        start = text.find("```") + 3
+        end = text.find("```", start)
+        if end != -1:
+            return text[start:end].strip()
+    
+    # Return original text if no code blocks found
+    return text.strip()
+
 async def analyze_with_gemini(video_clips: List[str]) -> Optional[AnalysisResult]:
     """Analyze video clips using Google Gemini API"""
     if not GEMINI_API_KEY:
@@ -190,100 +239,104 @@ async def analyze_with_gemini(video_clips: List[str]) -> Optional[AnalysisResult
     
     try:
         # Get the model
-        model = genai.GenerativeModel('gemini-2.0-flash-exp')
+        model = genai.GenerativeModel('gemini-2.5-pro-preview-05-06')
         
-        # Prepare the content parts
-        parts = [
-            "Analyze this video content and determine: 1) Is it NSFW? 2) What category does it fall into? Categories: Safe, Violence, Sexual Content, Graphic Content, Hate Speech, Other. Provide a confidence score (0-1) and brief explanation. Format your response as JSON with keys: is_nsfw (boolean), category (string), confidence (float), explanation (string)"
-        ]
+        # Prepare the prompt
+        prompt = """You are a strict content-safety engine. Analyze the video content and determine if it's safe or NSFW.
+
+IMPORTANT: If you detect ANY profanity, swearing, strong language, or curse words (including implied, censored, or abbreviated forms), you MUST categorize it as "profanity".
+
+Return your analysis in this exact JSON format (no markdown, just pure JSON):
+{
+    "status": "safe" or "nsfw",
+    "categories": ["pornography", "violence", "self-harm", "weapons", "profanity", "other"],
+    "severity": 0-5,
+    "description": "brief 1-2 sentence description"
+}
+
+Severity scale:
+0 = safe content
+1 = suggestive
+2 = mature
+3 = explicit
+4 = extreme
+5 = illegal
+
+Categories (choose ALL that apply):
+- pornography (sexual/nudity)
+- violence (harm/gore)
+- self-harm (suicide/injury)
+- weapons (guns/knives/explosives)
+- profanity (ANY strong language, swearing, curse words, f-words, s-words, etc.)
+- other (hate speech/drugs/disturbing content that doesn't fit above)
+
+CRITICAL: If you mention profanity, swearing, strong language, or curse words in your description, you MUST include "profanity" in the categories array.
+
+Multiple categories allowed if applicable."""
         
-        # Add video clips as base64 data
+        # Process each clip
+        results = []
         for i, clip in enumerate(video_clips):
-            parts.append({
-                "mime_type": "video/mp4",
-                "data": clip
-            })
+            try:
+                # Convert base64 to bytes
+                video_bytes = base64.b64decode(clip)
+                
+                # Create content parts
+                content = [
+                    prompt,
+                    {
+                        "mime_type": "video/mp4",
+                        "data": video_bytes
+                    }
+                ]
+                
+                # Generate content
+                response = model.generate_content(content)
+                
+                if response and response.text:
+                    # Extract JSON from markdown if needed
+                    json_text = extract_json_from_markdown(response.text)
+                    logger.info(f"Extracted JSON for clip {i}: {json_text[:200]}...")
+                    
+                    # Parse JSON response
+                    try:
+                        # Log the raw JSON before parsing
+                        logger.info(f"Raw JSON response for clip {i}: {json_text}")
+                        
+                        result = GeminiResponse.model_validate_json(json_text)
+                        
+                        # Log the parsed result
+                        logger.info(f"Parsed result for clip {i}: status={result.status}, categories={result.categories}, severity={result.severity}")
+                        
+                        results.append(result)
+                        logger.info(f"Successfully parsed clip {i} result")
+                    except Exception as e:
+                        logger.error(f"Failed to parse Gemini response for clip {i}: {e}")
+                        logger.error(f"Raw response: {response.text}")
+                        continue
+                
+            except Exception as e:
+                logger.error(f"Error processing clip {i}: {e}")
+                continue
         
-        # Run in thread pool to avoid blocking the async event loop
-        import asyncio
-        loop = asyncio.get_event_loop()
-        
-        def run_gemini():
-            return model.generate_content(parts)
-        
-        response = await loop.run_in_executor(None, run_gemini)
-        
-        if not response or not response.text:
-            logger.error("Empty response from Gemini")
+        if not results:
+            logger.error("No valid results from Gemini analysis")
             return None
         
-        content = response.text
-        logger.info(f"Gemini response: {content[:200]}...")
+        # Combine results (take the most severe result)
+        final_result = max(results, key=lambda x: x.severity)
         
-        # Try to parse as JSON - handle markdown code blocks
-        try:
-            # Remove markdown code blocks if present
-            json_content = content.strip()
-            
-            # Handle markdown code blocks
-            if '```json' in json_content:
-                # Extract JSON from ```json blocks
-                start = json_content.find('```json') + 7
-                end = json_content.find('```', start)
-                if end != -1:
-                    json_content = json_content[start:end].strip()
-            elif '```' in json_content:
-                # Handle generic code blocks
-                start = json_content.find('```') + 3
-                end = json_content.find('```', start)
-                if end != -1:
-                    json_content = json_content[start:end].strip()
-            
-            # Try to find JSON within the content if it's not in code blocks
-            if not json_content.startswith('{'):
-                # Look for JSON object in the content
-                start_brace = json_content.find('{')
-                if start_brace != -1:
-                    # Find the matching closing brace
-                    brace_count = 0
-                    end_brace = start_brace
-                    for i, char in enumerate(json_content[start_brace:], start_brace):
-                        if char == '{':
-                            brace_count += 1
-                        elif char == '}':
-                            brace_count -= 1
-                            if brace_count == 0:
-                                end_brace = i + 1
-                                break
-                    json_content = json_content[start_brace:end_brace]
-            
-            logger.info(f"Extracted JSON content: {json_content}")
-            result_json = json.loads(json_content)
-            logger.info(f"Parsed JSON: {result_json}")
-            
-            analysis_result = AnalysisResult(
-                method="gemini",
-                is_nsfw=result_json.get('is_nsfw', False),
-                category=result_json.get('category', 'Unknown'),
-                explanation=result_json.get('explanation', ''),
-                confidence=result_json.get('confidence', 0.5)
-            )
-            
-            logger.info(f"Final AnalysisResult: is_nsfw={analysis_result.is_nsfw}, category={analysis_result.category}")
-            return analysis_result
-        except json.JSONDecodeError as e:
-            logger.error(f"JSON parsing failed: {e}, content: {content}")
-            # Fallback parsing
-            is_nsfw = 'nsfw' in content.lower() and 'not nsfw' not in content.lower()
-            category = extract_category_from_text(content)
-            
-            return AnalysisResult(
-                method="gemini",
-                is_nsfw=is_nsfw,
-                category=category,
-                explanation=content
-            )
-    
+        analysis_result = AnalysisResult(
+            method="gemini",
+            status=final_result.status,
+            categories=final_result.categories,
+            severity=final_result.severity,
+            description=final_result.description
+        )
+        
+        logger.info(f"Final AnalysisResult: status={analysis_result.status}, categories={analysis_result.categories}, severity={analysis_result.severity}")
+        return analysis_result
+        
     except Exception as e:
         logger.error(f"Gemini analysis failed: {e}")
         return None
@@ -328,8 +381,8 @@ async def analyze_with_joy_caption(frame_base64: str) -> Optional[str]:
         logger.error(f"Joy Caption analysis failed: {e}")
         return None
 
-async def analyze_with_grok(captions: List[str]) -> Optional[AnalysisResult]:
-    """Analyze frame captions using Grok API"""
+async def analyze_with_grok(analysis_texts: List[str]) -> Optional[AnalysisResult]:
+    """Analyze combined visual and audio content using Grok API"""
     if not GROK_API_KEY:
         logger.error("Grok API key not configured")
         return None
@@ -341,19 +394,27 @@ async def analyze_with_grok(captions: List[str]) -> Optional[AnalysisResult]:
         "Content-Type": "application/json"
     }
     
-    # Prepare captions text
-    captions_text = "\n\n".join([f"Frame {i+1}: {caption}" for i, caption in enumerate(captions)])
+    # Combine all analysis texts
+    combined_text = "\n\n".join(analysis_texts)
     
     payload = {
         "model": "grok-3-mini",
         "messages": [
             {
                 "role": "system",
-                "content": "You are analyzing image descriptions to determine if video content is NSFW. Categorize as: Safe, Violence, Sexual Content, Graphic Content, Hate Speech, or Other. Respond in JSON format with keys: is_nsfw (boolean), category (string), confidence (float 0-1), explanation (string)"
+                "content": "You are a strict content-safety engine. Analyze the combined visual and audio content. "
+                "Return JSON exactly: "
+                "{\"status\":\"safe\"|\"nsfw\", \"categories\":[\"pornography\"|\"violence\"|\"self-harm\"|\"weapons\"|\"profanity\"|\"other\"], "
+                "\"severity\":0-5, \"description\":\"brief 1-2 sentence description\"}. "
+                "Severity scale: 0=safe content, 1=suggestive, 2=mature, 3=explicit, 4=extreme, 5=illegal. "
+                "Categories: pornography (sexual/nudity), violence (harm/gore), self-harm (suicide/injury), "
+                "weapons (guns/knives/explosives), profanity (strong language/swearing), other (hate/drugs/disturbing). "
+                "Multiple categories allowed if applicable. "
+                "Consider both visual descriptions and audio transcript in your analysis."
             },
             {
                 "role": "user",
-                "content": f"Analyze these frame descriptions from a video and determine if it's NSFW:\n\n{captions_text}"
+                "content": f"Analyze this content:\n\n{combined_text}"
             }
         ]
     }
@@ -374,40 +435,61 @@ async def analyze_with_grok(captions: List[str]) -> Optional[AnalysisResult]:
                 
                 # Parse JSON response
                 try:
-                    result_json = json.loads(content)
+                    result = GeminiResponse.model_validate_json(content)
                     return AnalysisResult(
-                        method="joycaption-grok",
-                        is_nsfw=result_json.get('is_nsfw', False),
-                        category=result_json.get('category', 'Unknown'),
-                        explanation=result_json.get('explanation', ''),
-                        confidence=result_json.get('confidence', 0.5)
+                        method="joycaption-whisper-grok",
+                        status=result.status,
+                        categories=result.categories,
+                        severity=result.severity,
+                        description=result.description
                     )
-                except json.JSONDecodeError:
-                    # Fallback parsing
-                    is_nsfw = 'nsfw' in content.lower() and 'not nsfw' not in content.lower()
-                    category = extract_category_from_text(content)
-                    
-                    return AnalysisResult(
-                        method="joycaption-grok",
-                        is_nsfw=is_nsfw,
-                        category=category,
-                        explanation=content
-                    )
+                except Exception as e:
+                    logger.error(f"Failed to parse Grok response: {e}")
+                    return None
     
     except Exception as e:
         logger.error(f"Grok analysis failed: {e}")
         return None
 
-def extract_category_from_text(text: str) -> str:
-    """Extract category from text response"""
-    categories = ['Safe', 'Violence', 'Sexual Content', 'Graphic Content', 'Hate Speech', 'Other']
-    text_lower = text.lower()
-    
-    for category in categories:
-        if category.lower() in text_lower:
-            return category
-    
-    return 'Other'
+async def transcribe_audio(video_path: str) -> Optional[str]:
+    """Extract and transcribe audio from video using Whisper"""
+    try:
+        # Extract audio to temporary file
+        temp_audio = os.path.join(TEMP_DIR, f"audio_{datetime.now().timestamp()}.wav")
+        
+        cmd = [
+            "ffmpeg", "-i", video_path,
+            "-vn",  # No video
+            "-acodec", "pcm_s16le",  # PCM 16-bit
+            "-ar", "16000",  # 16kHz sample rate
+            "-ac", "1",  # Mono
+            "-y", temp_audio
+        ]
+        
+        try:
+            subprocess.run(cmd, capture_output=True, check=True)
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Error extracting audio: {e}")
+            return None
+        
+        # Run Whisper in thread pool
+        loop = asyncio.get_event_loop()
+        
+        def run_whisper():
+            model = get_whisper_model()
+            result = model.transcribe(temp_audio)
+            return result["text"]
+        
+        transcript = await loop.run_in_executor(None, run_whisper)
+        
+        # Clean up
+        os.unlink(temp_audio)
+        
+        return transcript.strip() if transcript else None
+        
+    except Exception as e:
+        logger.error(f"Whisper transcription failed: {e}")
+        return None
 
 # API Endpoints
 @app.post("/analyze", response_model=AnalysisResult)
@@ -458,15 +540,19 @@ async def analyze_video(file: UploadFile = File(...)):
         if video_clips:
             result = await analyze_with_gemini(video_clips)
             if result:
-                logger.info(f"Gemini analysis successful: {result.category}")
+                logger.info(f"Gemini analysis successful: {result.status}")
                 return result
         
-        # Step 2: Fallback to Joy Caption + Grok
-        logger.info("Falling back to Joy Caption + Grok analysis")
-        frames = await extract_video_frames(temp_file_path, num_frames=3)  # Reduced to 3 frames for testing
+        # Step 2: Fallback to Joy Caption + Whisper + Grok
+        logger.info("Falling back to Joy Caption + Whisper + Grok analysis")
         
+        # Get visual analysis from frames
+        frames = await extract_video_frames(temp_file_path, num_frames=3)
         if not frames:
             raise HTTPException(status_code=500, detail="Failed to extract frames from video")
+        
+        # Get audio analysis from Whisper
+        transcript = await transcribe_audio(temp_file_path)
         
         # Analyze frames with Joy Caption
         captions = []
@@ -479,20 +565,34 @@ async def analyze_video(file: UploadFile = File(...)):
         if not captions:
             raise HTTPException(status_code=500, detail="Failed to generate captions for frames")
         
-        # Analyze captions with Grok
-        result = await analyze_with_grok(captions)
+        # Combine visual and audio analysis for Grok
+        analysis_text = "\n\n".join([
+            "Visual Analysis:",
+            *[f"Frame {i+1}: {caption}" for i, caption in enumerate(captions)],
+            "\nAudio Analysis:",
+            transcript if transcript else "No audio transcript available"
+        ])
+        
+        # Analyze combined content with Grok
+        result = await analyze_with_grok([analysis_text])  # Pass as single item list
         if result:
-            logger.info(f"Grok analysis successful: {result.category}")
+            logger.info(f"Grok analysis successful: {result.status}")
             return result
         
-        # If all methods fail
-        raise HTTPException(status_code=500, detail="All analysis methods failed")
+        # If all methods fail, return error
+        raise HTTPException(
+            status_code=500,
+            detail="All analysis methods failed. Please try again later."
+        )
     
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Unexpected error during analysis: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(
+            status_code=500,
+            detail=f"Analysis failed: {str(e)}"
+        )
     
     finally:
         # Clean up

@@ -64,3 +64,5 @@ docs/_build/
 docs/.build/
 
 **.mp4
+
+**/temp/**

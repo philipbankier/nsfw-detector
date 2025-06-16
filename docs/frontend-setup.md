@@ -41,6 +41,36 @@ npm start
 
 The app will be available at `http://localhost:3005`
 
+## 🧪 Testing
+
+### 1. Run Tests
+```bash
+# Run all tests
+npm test
+
+# Run tests with coverage
+npm test -- --coverage
+```
+
+### 2. Test Cases
+The test suite includes:
+- File upload handling
+- Drag and drop functionality
+- API integration
+- Error handling
+- Multiple category display
+- Severity level visualization
+
+### 3. Manual Testing Checklist
+- [ ] File upload works with various video formats
+- [ ] Drag and drop interface is responsive
+- [ ] Loading states display correctly
+- [ ] Error messages are clear and helpful
+- [ ] Results display all categories correctly
+- [ ] Severity levels are color-coded appropriately
+- [ ] Mobile responsiveness works
+- [ ] Browser compatibility (Chrome, Firefox, Safari, Edge)
+
 ## 🚀 Production Build
 
 ### 1. Build for Production
@@ -131,26 +161,30 @@ sudo certbot --nginx -d yourdomain.com -d www.yourdomain.com
 sudo certbot renew --dry-run
 ```
 
-## 🧪 Testing the Frontend
+## 🎨 UI Features
 
-### 1. Basic Functionality Test
-- Navigate to your domain
-- Check if the upload interface loads
-- Verify drag-and-drop functionality
-- Test file selection
+### 1. Content Analysis Display
+- Status indicator (Safe/NSFW)
+- Multiple category badges
+- Severity level with color coding
+- Analysis method used
+- Detailed description
 
-### 2. API Integration Test
-- Upload a small test video
-- Verify the analysis request is sent
-- Check if results display correctly
-- Test error handling with invalid files
+### 2. User Interface
+- Drag and drop file upload
+- File type validation
+- Progress indicators
+- Error handling
+- Responsive design
+- Mobile-friendly interface
 
-### 3. Browser Compatibility
-Test in major browsers:
-- Chrome/Chromium
-- Firefox
-- Safari
-- Edge
+### 3. Color Coding
+- Safe: Green
+- Suggestive: Blue
+- Mature: Yellow
+- Explicit: Orange
+- Extreme: Red
+- Illegal: Dark Red
 
 ## 🔧 Troubleshooting
 
@@ -188,61 +222,6 @@ location / {
 - Enable gzip compression in nginx
 - Use CDN for static assets
 - Optimize images and icons
-
-### Performance Optimization
-
-#### 1. Enable Compression
-Already configured in nginx config:
-```nginx
-gzip on;
-gzip_types text/plain text/css application/json application/javascript;
-```
-
-#### 2. Cache Static Assets
-```nginx
-location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg)$ {
-    expires 1y;
-    add_header Cache-Control "public, immutable";
-}
-```
-
-#### 3. Monitor Bundle Size
-```bash
-# Analyze bundle size
-npm install -g webpack-bundle-analyzer
-npx webpack-bundle-analyzer build/static/js/*.js
-```
-
-## 🔄 Updates and Maintenance
-
-### 1. Update Frontend
-```bash
-# Local development
-git pull origin main
-npm install
-npm run build
-
-# Deploy to server
-scp -r build/* user@server:/var/www/nsfw-analyzer/
-```
-
-### 2. Monitor Logs
-```bash
-# Nginx access logs
-tail -f /var/log/nginx/nsfw-analyzer-frontend-access.log
-
-# Nginx error logs
-tail -f /var/log/nginx/nsfw-analyzer-frontend-error.log
-```
-
-### 3. Security Updates
-```bash
-# Update dependencies
-npm audit
-npm audit fix
-
-# Update Node.js version as needed
-```
 
 ## 📊 Monitoring
 
